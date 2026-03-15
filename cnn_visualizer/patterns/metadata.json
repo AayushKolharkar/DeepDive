@@ -1,0 +1,52 @@
+[
+  {
+    "id": "4745108b",
+    "timestamp": "20260314_190303",
+    "model": "ResNet18",
+    "layer": "layer4.1.conv1",
+    "channel": 115,
+    "iterations": 256,
+    "device": "cpu",
+    "filepath": "patterns\\20260314_190303_4745108b_layer4_1_conv1_ch115.png"
+  },
+  {
+    "id": "1b51ca8c",
+    "timestamp": "20260314_190348",
+    "model": "ResNet18",
+    "layer": "layer4.1.conv1",
+    "channel": 259,
+    "iterations": 256,
+    "device": "cpu",
+    "filepath": "patterns\\20260314_190348_1b51ca8c_layer4_1_conv1_ch259.png"
+  },
+  {
+    "id": "b4c04567",
+    "timestamp": "20260314_190548",
+    "model": "AlexNet",
+    "layer": "features.0",
+    "channel": 59,
+    "iterations": 256,
+    "device": "cpu",
+    "filepath": "patterns\\20260314_190548_b4c04567_features_0_ch59.png"
+  },
+  {
+    "id": "786c1040",
+    "timestamp": "20260314_190611",
+    "model": "AlexNet",
+    "layer": "features.0",
+    "channel": 59,
+    "iterations": 256,
+    "device": "cpu",
+    "filepath": "patterns\\20260314_190611_786c1040_features_0_ch59.png"
+  },
+  {
+    "id": "5245eda0",
+    "timestamp": "20260314_190814",
+    "model": "AlexNet",
+    "layer": "features.10",
+    "channel": 124,
+    "iterations": 256,
+    "device": "cpu",
+    "filepath": "patterns\\20260314_190814_5245eda0_features_10_ch124.png"
+  }
+]

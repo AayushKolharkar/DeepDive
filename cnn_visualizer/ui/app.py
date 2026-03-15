@@ -23,14 +23,24 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from ui.sidebar import Sidebar
 from ui.grid_view import GridView
+from ui.pattern_gallery import PatternGallery, save_pattern as gallery_save_pattern
+from ui.channel_filter_window import ChannelFilterWindow
 from core.model_loader import load_model
 from core.hook_engine import HookEngine
 from core.gradcam import compute_gradcam
+from core.visualizer import synthesize_channel_pattern
 from processing.tensor_to_image import process_tensor_to_images
 from export.reporter import generate_report, save_report
 from .theme import *
 
 SSAA = 2  # Supersampling scale factor for all render methods
+
+# Suppress OpenCV's verbose MSMF/videoio warnings on Windows.
+# Level 3 = ERROR only (default is 5 = verbose).
+try:
+    cv2.setLogLevel(3)
+except AttributeError:
+    pass  # older OpenCV versions don't have setLogLevel
 
 
 # ── Rendering utilities ───────────────────────────────────────────────────────
@@ -175,6 +185,10 @@ class CNNVisualizerApp(ctk.CTk):
         self._latest_frame = None
         self._frame_lock = threading.Lock()
         self._result_queue: queue.Queue = queue.Queue(maxsize=1)
+        # Thread-safe config snapshot — written only on main thread,
+        # read by inference thread. Eliminates all Tk calls from bg threads.
+        self._config_lock:     threading.Lock = threading.Lock()
+        self._config_snapshot: dict           = {}
         self._frame_count: int = 0
         self._cached_redundancy: torch.Tensor | None = None
 
@@ -209,8 +223,29 @@ class CNNVisualizerApp(ctk.CTk):
         self.inspector_similar_labels: list = []
         self.inspector_bias_label: ctk.CTkLabel | None = None
 
+        # Synthesis state
+        self._current_pattern: Image.Image | None = None
+        self._synthesis_running: bool = False
+        self.inspector_synth_btn: ctk.CTkButton | None = None
+        self.inspector_progress_bar: ctk.CTkProgressBar | None = None
+        self.inspector_eta_label: ctk.CTkLabel | None = None
+        self.inspector_pattern_label: ctk.CTkLabel | None = None
+        self.inspector_save_btn: ctk.CTkButton | None = None
+        self._gallery: PatternGallery | None = None
+        self._active_channel_filter: set[int] | None = None
+        self._filter_window: ChannelFilterWindow | None = None
+
         self._setup_ui()
         self._build_inspector_skeleton()
+        self._gallery = PatternGallery(self)
+        self._filter_window = ChannelFilterWindow(
+            self,
+            num_channels   = 64,
+            current_filter = None,
+            on_apply       = self._on_filter_applied,
+        )
+        self.sidebar.on_open_filter_callback  = self._open_filter_window
+        self.sidebar.on_clear_filter_callback = self._clear_channel_filter
 
     # ------------------------------------------------------------------ #
     #  UI setup                                                            #
@@ -384,6 +419,50 @@ class CNNVisualizerApp(ctk.CTk):
         self.inspector_bias_label = ctk.CTkLabel(bias_f, text="")
         self.inspector_bias_label.pack(pady=8)
 
+        synth_f = _section("PATTERN SYNTHESIS")
+        ctk.CTkLabel(
+            synth_f,
+            text="Synthesize the pattern this channel has learned to detect.",
+            font=ctk.CTkFont(size=9), text_color=C_TEXT_MUT,
+            wraplength=290, justify="left",
+        ).pack(anchor="w", padx=12, pady=(0, 6))
+
+        btn_row = ctk.CTkFrame(synth_f, fg_color="transparent")
+        btn_row.pack(fill="x", padx=12, pady=(0, 6))
+        btn_row.grid_columnconfigure(0, weight=1)
+        btn_row.grid_columnconfigure(1, weight=0)
+
+        self.inspector_synth_btn = ctk.CTkButton(
+            btn_row, text="Synthesize Pattern",
+            fg_color=C_ACCENT, hover_color=C_BG_FLOAT,
+            command=self._start_synthesis,
+        )
+        self.inspector_synth_btn.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        ctk.CTkButton(
+            btn_row, text="Gallery", width=72,
+            fg_color=C_BG_FLOAT, hover_color=C_BG_RAISED,
+            text_color=C_TEXT_SEC, command=self._open_gallery,
+        ).grid(row=0, column=1)
+
+        self.inspector_progress_bar = ctk.CTkProgressBar(
+            synth_f, fg_color=C_BG_FLOAT, progress_color=C_ACCENT,
+        )
+        self.inspector_progress_bar.set(0)
+
+        self.inspector_eta_label = ctk.CTkLabel(
+            synth_f, text="", font=ctk.CTkFont(size=10), text_color=C_TEXT_SEC,
+        )
+
+        self.inspector_pattern_label = ctk.CTkLabel(synth_f, text="")
+
+        self.inspector_save_btn = ctk.CTkButton(
+            synth_f, text="Save Pattern",
+            fg_color=C_BG_FLOAT, hover_color=C_BG_RAISED,
+            border_width=1, border_color=C_BORDER_ACT,
+            text_color=C_TEXT_PRI, command=self._save_current_pattern,
+        )
+
     # ------------------------------------------------------------------ #
     #  Model / image loading                                               #
     # ------------------------------------------------------------------ #
@@ -432,7 +511,8 @@ class CNNVisualizerApp(ctk.CTk):
         It runs on the main thread inside _poll_results() instead, so
         no Tkinter widgets are touched from the inference thread.
         """
-        cfg = self.sidebar.config
+        with self._config_lock:
+            cfg = dict(self._config_snapshot)
         mode = cfg["mode"]
         images = []
         dynamic_title = ""
@@ -484,7 +564,6 @@ class CNNVisualizerApp(ctk.CTk):
             images, self.ema_channel_sums, health_metrics, cached_redundancy, sim_matrix = (
                 process_tensor_to_images(
                     tensor,
-                    max_channels=64,   # show up to 64 — grid fills available width
                     is_live=(source_text == "Live Feed"),
                     use_heatmap=cfg["heatmap"],
                     ema_sums=self.ema_channel_sums,
@@ -923,9 +1002,23 @@ class CNNVisualizerApp(ctk.CTk):
             messagebox.showwarning("Export", "No active data to export. Run a forward pass first.")
             return
         try:
+            pattern_path = None
+            if self._current_pattern is not None and self._inspected_channel is not None:
+                import torch as _torch
+                entry = gallery_save_pattern(
+                    pil_image  = self._current_pattern,
+                    model      = self.current_model or "unknown",
+                    layer      = self._inspected_layer or "",
+                    channel    = self._inspected_channel,
+                    iterations = 256,
+                    device     = "cuda" if _torch.cuda.is_available() else "cpu",
+                )
+                pattern_path = entry["filepath"]
+
             content = generate_report(
                 self.last_layer_name, self.last_health_metrics,
                 self.last_input_stats, self.sidebar.config["dead_threshold"],
+                pattern_path=pattern_path,
             )
             save_report(content)
             old = self.sidebar.export_btn.cget("text")
@@ -958,12 +1051,10 @@ class CNNVisualizerApp(ctk.CTk):
             )
             loading.destroy()
             layer_name = self.sidebar.config.get("layer", "")
-            ch_filter = parse_channel_filter(
-                self.sidebar.config.get("channel_filter_raw", ""))
             self.grid_view.update(images, title, force_rebuild=True,
                                   health_metrics=health_metrics, layer_name=layer_name,
                                   cell_size=self.sidebar.config.get("cell_size", 140),
-                                  channel_filter=ch_filter)
+                                  channel_filter=self._active_channel_filter)
             self._update_telemetry(layer_name, None, input_stats, health_metrics)
             if flow_data:     self._last_flow_data = flow_data
             if sim_matrix is not None:
@@ -979,13 +1070,44 @@ class CNNVisualizerApp(ctk.CTk):
     # ------------------------------------------------------------------ #
 
     def _capture_thread_func(self):
+        # Target 30fps max — webcams can't deliver faster, and reading at
+        # 200/sec is what triggers MSMF MF_E_END_OF_STREAM on Windows.
+        FRAME_INTERVAL  = 1.0 / 30.0   # ~33ms
+        BACKOFF_SLEEP   = 0.5          # sleep after 5 consecutive failures
+        MAX_FAILURES    = 30           # attempt camera re-open after this many
+        consecutive_failures = 0
+
         while not self._inference_stop_event.is_set():
+            t_start = time.time()
+
             if self.camera is not None and self.camera.isOpened():
                 ret, frame = self.camera.read()
                 if ret:
+                    consecutive_failures = 0
                     with self._frame_lock:
                         self._latest_frame = cv2.flip(frame, 1)
-            time.sleep(0.005)
+                else:
+                    consecutive_failures += 1
+
+                    if consecutive_failures == 5:
+                        # MSMF stall — give the driver time to recover
+                        time.sleep(BACKOFF_SLEEP)
+
+                    elif consecutive_failures >= MAX_FAILURES:
+                        # Full recovery: release and re-open
+                        consecutive_failures = 0
+                        try:
+                            self.camera.release()
+                            time.sleep(0.5)
+                            self.camera = cv2.VideoCapture(0)
+                        except Exception:
+                            pass
+
+            # Pace reads to ~30fps regardless of how fast the loop runs
+            elapsed = time.time() - t_start
+            remaining = FRAME_INTERVAL - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     def _inference_thread_func(self):
         while not self._inference_stop_event.is_set():
@@ -1014,6 +1136,14 @@ class CNNVisualizerApp(ctk.CTk):
                     pass
             except Exception:
                 pass
+
+    def _refresh_config_snapshot(self):
+        """Snapshot sidebar.config onto the main thread only.
+        Background threads read _config_snapshot; they never call sidebar.config.
+        """
+        snapshot = self.sidebar.config
+        with self._config_lock:
+            self._config_snapshot = snapshot
 
     def _poll_results(self):
         if not self.camera_active:
@@ -1060,7 +1190,8 @@ class CNNVisualizerApp(ctk.CTk):
         if not self.current_model:
             messagebox.showwarning("Warning", "Please select a model first.")
             return
-        if not self.sidebar.config["layer"] or self.sidebar.config["layer"] == "Load model first...":
+        self._refresh_config_snapshot()
+        if not self._config_snapshot.get("layer") or self._config_snapshot.get("layer") == "Load model first...":
             messagebox.showwarning("Warning", "Please select a valid Conv Layer.")
             return
 
@@ -1088,6 +1219,7 @@ class CNNVisualizerApp(ctk.CTk):
                 try: self._result_queue.get_nowait()
                 except queue.Empty: break
 
+            self._refresh_config_snapshot()   # snapshot before threads read config
             self._inference_stop_event.clear()
             self._capture_thread   = threading.Thread(target=self._capture_thread_func, daemon=True)
             self._inference_thread = threading.Thread(target=self._inference_thread_func, daemon=True)
@@ -1128,12 +1260,24 @@ class CNNVisualizerApp(ctk.CTk):
         self._inspected_layer   = layer_name or self.sidebar.config.get("layer")
 
         if not self._inspector_visible:
-            # Add the inspector pane to the PanedWindow on demand
             self._paned.add(self._inspector_pane_frame, weight=0)
             self._inspector_visible = True
 
-        self._update_inspector()
+        # Show loading state immediately so the click feels instant,
+        # then run the expensive renders on a background thread.
+        self.inspector_title.configure(
+            text=f"Channel {channel_idx}  ·  {self._inspected_layer or '—'}"
+        )
+        self.inspector_map_label.configure(image="", text="Loading...")
+        self.inspector_hist_label.configure(image="", text="")
+        self.inspector_bias_label.configure(image="", text="")
+        for lbl in self.inspector_stats.values():
+            lbl.configure(text="—")
+
         self.grid_view.refresh_borders(channel_idx)
+
+        # Defer the heavy renders so Tk can process the loading state first
+        self.after(10, self._update_inspector_async)
 
     def _close_inspector(self):
         self._inspector_visible = False
@@ -1146,7 +1290,284 @@ class CNNVisualizerApp(ctk.CTk):
             pass
         self.grid_view.clear_selection()
 
+
+    # ------------------------------------------------------------------ #
+    #  Pattern synthesis                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _open_filter_window(self):
+        """Open the channel filter window, refreshed to current channel count."""
+        if self._filter_window is None:
+            return
+        num_ch = (self._last_tensor.shape[1]
+                  if self._last_tensor is not None else 64)
+        self._filter_window.refresh(num_ch, self._active_channel_filter)
+        self._filter_window.show()
+
+    def _on_filter_applied(self, filter_set: set[int] | None):
+        """Called by ChannelFilterWindow when user clicks Apply."""
+        self._active_channel_filter = filter_set
+        self._update_filter_btn_label()
+        # Immediately re-render grid with new filter
+        if self._last_tensor is not None:
+            self.grid_view.set_channel_filter(filter_set)
+            self.grid_view.update(
+                self.grid_view._pending_items or [],
+                self.grid_view.current_display_layer or "",
+                force_rebuild=True,
+                health_metrics=self.last_health_metrics,
+                layer_name=self.current_layer_name if hasattr(self, "current_layer_name") else None,
+                cell_size=self.sidebar.config.get("cell_size", 140),
+                channel_filter=filter_set,
+            )
+
+    def _clear_channel_filter(self):
+        """Clear filter — show all channels."""
+        self._active_channel_filter = None
+        if self._filter_window:
+            num_ch = (self._last_tensor.shape[1]
+                      if self._last_tensor is not None else 64)
+            self._filter_window.refresh(num_ch, None)
+        self._update_filter_btn_label()
+        self.grid_view.set_channel_filter(None)
+        if self._last_tensor is not None:
+            self.grid_view.update(
+                self.grid_view._pending_items or [],
+                self.grid_view.current_display_layer or "",
+                force_rebuild=True,
+                health_metrics=self.last_health_metrics,
+                cell_size=self.sidebar.config.get("cell_size", 140),
+                channel_filter=None,
+            )
+
+    def _update_filter_btn_label(self):
+        """Update the sidebar button text to reflect active filter state."""
+        f = self._active_channel_filter
+        if f is None:
+            label = "Filter Channels  ▸  All"
+            self.sidebar.channel_filter_btn.configure(
+                text=label, text_color=C_TEXT_SEC,
+                border_color=C_BORDER_SUB)
+        else:
+            n = len(f)
+            label = f"Filter Channels  ▸  {n} selected"
+            self.sidebar.channel_filter_btn.configure(
+                text=label, text_color=C_ACCENT,
+                border_color=C_ACCENT)
+
+    def _open_gallery(self):
+        if self._gallery:
+            self._gallery.show()
+
+    def _start_synthesis(self):
+        ch    = self._inspected_channel
+        layer = self._inspected_layer
+        if ch is None or layer is None or self.hook_engine is None:
+            return
+        if self._synthesis_running:
+            return
+
+        self._synthesis_running = True
+        self._current_pattern   = None
+
+        self.inspector_synth_btn.configure(state="disabled", text="Synthesizing...")
+        self.inspector_progress_bar.set(0)
+        self.inspector_progress_bar.pack(fill="x", padx=12, pady=(0, 2))
+        self.inspector_eta_label.configure(text="Starting...")
+        self.inspector_eta_label.pack(anchor="w", padx=12, pady=(0, 6))
+        self.inspector_save_btn.pack_forget()
+        self.inspector_pattern_label.pack_forget()
+
+        captured_ch    = ch
+        captured_layer = layer
+
+        def _thread_fn():
+            try:
+                import torch as _torch
+                device_str = "cuda" if _torch.cuda.is_available() else "cpu"
+                result = synthesize_channel_pattern(
+                    model       = self.hook_engine.model,
+                    layer_name  = captured_layer,
+                    channel_idx = captured_ch,
+                    iterations  = 256,
+                    on_progress = self._on_synth_progress,
+                )
+                self.after(0, lambda r=result, d=device_str:
+                           self._on_synthesis_done(r, d))
+            except Exception as exc:
+                self.after(0, lambda e=str(exc): self._on_synthesis_error(e))
+
+        threading.Thread(target=_thread_fn, daemon=True).start()
+
+    def _on_synth_progress(self, step: int, total: int, eta: float):
+        def _update():
+            if not self._synthesis_running:
+                return
+            self.inspector_progress_bar.set(step / max(total, 1))
+            if step >= total:
+                self.inspector_eta_label.configure(text="Finishing...")
+            elif eta < 60:
+                self.inspector_eta_label.configure(text=f"ETA: {eta:.0f}s")
+            else:
+                m = int(eta // 60); s = int(eta % 60)
+                self.inspector_eta_label.configure(text=f"ETA: {m}m {s:02d}s")
+        self.after(0, _update)
+
+    def _on_synthesis_done(self, pil_image: Image.Image, device: str):
+        self._synthesis_running = False
+        self._current_pattern   = pil_image
+
+        disp    = pil_image.resize((280, 280), Image.LANCZOS)
+        ctk_img = ctk.CTkImage(light_image=disp, dark_image=disp, size=(280, 280))
+        self.inspector_pattern_label.configure(image=ctk_img, text="")
+        self.inspector_pattern_label.pack(pady=(0, 6))
+        self.inspector_save_btn.pack(fill="x", padx=12, pady=(0, 8))
+        self.inspector_progress_bar.pack_forget()
+        self.inspector_eta_label.pack_forget()
+        self.inspector_synth_btn.configure(state="normal",
+                                            text="Synthesize Pattern")
+
+    def _on_synthesis_error(self, message: str):
+        self._synthesis_running = False
+        self.inspector_progress_bar.pack_forget()
+        self.inspector_eta_label.configure(text=f"Error: {message}")
+        self.inspector_synth_btn.configure(state="normal",
+                                            text="Synthesize Pattern")
+
+    def _save_current_pattern(self):
+        if self._current_pattern is None:
+            return
+        ch = self._inspected_channel; layer = self._inspected_layer
+        if ch is None or layer is None:
+            return
+        import torch as _torch
+        entry = gallery_save_pattern(
+            pil_image  = self._current_pattern,
+            model      = self.current_model or "unknown",
+            layer      = layer,
+            channel    = ch,
+            iterations = 256,
+            device     = "cuda" if _torch.cuda.is_available() else "cpu",
+        )
+        old = self.inspector_save_btn.cget("text")
+        self.inspector_save_btn.configure(text="Saved!")
+        self.after(2000, lambda: self.inspector_save_btn.configure(text=old))
+
+    def _update_inspector_async(self):
+        """
+        Kick off inspector population on a background thread.
+        All widget updates are scheduled back onto the main thread via after(0).
+        This prevents channel-click freezes when renders are expensive.
+        """
+        ch    = self._inspected_channel
+        layer = self._inspected_layer
+        if ch is None or self._last_tensor is None:
+            return
+        tensor = self._last_tensor
+        if ch >= tensor.shape[1]:
+            return
+
+        snapshot = {
+            "ch":         ch,
+            "layer":      layer,
+            "tensor":     tensor,
+            "health":     self.last_health_metrics,
+            "sim_matrix": self._last_sim_matrix,
+            "sorted_idx": self._last_sorted_indices,
+            "threshold":  self.sidebar.health_slider.get(),
+        }
+
+        def _worker():
+            try:
+                self._run_inspector_render(snapshot)
+            except Exception as exc:
+                self.after(0, lambda e=str(exc):
+                    self.inspector_title.configure(
+                        text=f"Error: {e[:60]}"))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _run_inspector_render(self, s: dict):
+        """Heavy rendering on a background thread. No Tk calls here."""
+        ch = s["ch"]; layer = s["layer"]
+        tensor = s["tensor"]; hm = s["health"] or {}
+        ch_map = tensor[0, ch]
+
+        cn = ch_map.detach().cpu().numpy()
+        cmin, cmax = cn.min(), cn.max()
+        ch_norm = ((cn-cmin)/(cmax-cmin)*255).astype(np.uint8) if cmax>cmin                   else np.zeros_like(cn, dtype=np.uint8)
+        chl     = cv2.resize(ch_norm, (280,280), interpolation=cv2.INTER_LANCZOS4)
+        chc     = cv2.cvtColor(cv2.applyColorMap(chl, cv2.COLORMAP_VIRIDIS), cv2.COLOR_BGR2RGB)
+        map_pil = Image.fromarray(chc)
+        map_ctk = ctk.CTkImage(light_image=map_pil, dark_image=map_pil, size=(280,280))
+
+        dead_flag = "YES" if ch_map.var().item() < s["threshold"] else "no"
+        sat_val   = "N/A"
+        si = hm.get("saturation", {})
+        if si.get("per_channel") is not None and ch < len(si["per_channel"]):
+            sat_val = f"{si['per_channel'][ch].item()*100:.1f}%"
+        ema_rank = "N/A"
+        if s["sorted_idx"] is not None:
+            il = s["sorted_idx"].tolist()
+            if ch in il: ema_rank = f"#{il.index(ch)+1} of {len(il)}"
+
+        stats_vals = {
+            "Layer":      layer or "—",
+            "Channel":    str(ch),
+            "EMA Rank":   ema_rank,
+            "Act Range":  f"{ch_map.min().item():.3f} -> {ch_map.max().item():.3f}",
+            "Mean / Std": f"{ch_map.mean().item():.3f}  /  {ch_map.std().item():.3f}",
+            "Saturation": sat_val,
+            "Dead":       dead_flag,
+        }
+
+        hist_img = self._render_histogram(ch_map, canvas_w=280, canvas_h=100)
+        hist_ctk = ctk.CTkImage(light_image=hist_img, dark_image=hist_img,
+                                 size=(280,100))
+
+        similar = []
+        sm = s["sim_matrix"]
+        if sm is not None and ch < sm.shape[0]:
+            sr = sm[ch].clone(); sr[ch] = 0.0
+            tv, ti = torch.topk(sr, min(3, sr.shape[0]))
+            for sc2, sv2 in zip(ti.tolist(), tv.tolist()):
+                cell = self.grid_view.get_cell_data(sc2)
+                if cell and cell[0]:
+                    s2  = cell[0].resize((70,70), Image.NEAREST)
+                    ci2 = ctk.CTkImage(light_image=s2, dark_image=s2, size=(70,70))
+                    similar.append((ci2, f"Ch {sc2}\n{sv2:.2f}"))
+                else:
+                    similar.append((None, "-"))
+
+        bias_img = self._render_spatial_bias(ch_map)
+        bias_ctk = (ctk.CTkImage(light_image=bias_img, dark_image=bias_img,
+                                  size=(280,140)) if bias_img else None)
+
+        def _commit():
+            if self._inspected_channel != ch:
+                return  # user clicked elsewhere while we were rendering
+            self.inspector_title.configure(text=f"Channel {ch}  ·  {layer or '—'}")
+            self.inspector_map_label.configure(image=map_ctk, text="")
+            for key, val in stats_vals.items():
+                if key in self.inspector_stats:
+                    color = C_CRITICAL if key=="Dead" and val=="YES" else C_TEXT_PRI
+                    self.inspector_stats[key].configure(text=val, text_color=color)
+            self.inspector_hist_label.configure(image=hist_ctk)
+            for i, (si2, st2) in enumerate(similar):
+                if i >= len(self.inspector_similar_labels): break
+                il2, tl2 = self.inspector_similar_labels[i]
+                if si2: il2.configure(image=si2); tl2.configure(text=st2)
+                else:   il2.configure(image="");  tl2.configure(text="-")
+            if bias_ctk:
+                self.inspector_bias_label.configure(image=bias_ctk, text="")
+
+        self.after(0, _commit)
+
     def _update_inspector(self):
+        """Used by _poll_results to refresh inspector during live mode."""
+        self._update_inspector_async()
+
+    def _update_inspector_legacy(self):
         ch = self._inspected_channel
         if ch is None or self._last_tensor is None: return
         tensor = self._last_tensor

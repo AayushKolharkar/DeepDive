@@ -18,7 +18,7 @@ from core.diagnostics import (
 
 def process_tensor_to_images(
     tensor: torch.Tensor,
-    max_channels: int = 36,
+    max_channels: int = 10000,  # effectively unlimited — show all channels
     is_live: bool = False,
     use_heatmap: bool = True,
     ema_sums: torch.Tensor | None = None,

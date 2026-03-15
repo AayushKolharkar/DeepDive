@@ -3,18 +3,23 @@ Responsible for generating and saving diagnostic reports.
 """
 from __future__ import annotations
 
-def generate_report(layer_name: str, health_metrics: dict | None, input_stats: dict | None, threshold: float) -> str:
+
+def generate_report(
+    layer_name:   str,
+    health_metrics: dict | None,
+    input_stats:  dict | None,
+    threshold:    float,
+    pattern_path: str | None = None,
+) -> str:
     """
-    Generates a diagnostic report as a string.
-    
+    Generates a diagnostic report string.
+
     Args:
-        layer_name (str): The name of the layer being analyzed.
-        health_metrics (dict): Health metrics for the layer (dead neurons, etc.).
-        input_stats (dict): Input normalisation statistics.
-        threshold (float): Dead ReLU threshold.
-        
-    Returns:
-        str: The generated report string.
+        layer_name:   Name of the layer being analyzed.
+        health_metrics: Health metrics dict (dead neurons, saturation, etc.).
+        input_stats:  Input normalisation statistics.
+        threshold:    Dead ReLU variance threshold.
+        pattern_path: Path to a saved synthesized pattern image, if any.
     """
     lines = []
     lines.append("=== CNN VISUALIZER PRO: DIAGNOSTIC REPORT ===")
@@ -41,21 +46,20 @@ def generate_report(layer_name: str, health_metrics: dict | None, input_stats: d
     if input_stats:
         lines.append(f"Tensor Mean: {input_stats['mean']:.4f}")
         lines.append(f"Tensor Std:  {input_stats['std']:.4f}")
-        if (abs(input_stats['mean']) > 0.8 or input_stats['std'] < 0.2):
+        if abs(input_stats['mean']) > 0.8 or input_stats['std'] < 0.2:
             lines.append("WARNING: Input Distribution strongly deviates "
                          "from ImageNet normalization norms.")
         else:
             lines.append("Input Distribution matches expected ranges.")
-            
+
+    if pattern_path:
+        lines.append("\n--- SYNTHESIZED PATTERN ---")
+        lines.append(f"Pattern saved to: {pattern_path}")
+
     return "\n".join(lines) + "\n"
 
+
 def save_report(content: str, path: str = "diagnostic_report.txt"):
-    """
-    Saves the diagnostic report content to a file.
-    
-    Args:
-        content (str): Text content to write.
-        path (str): File path to save to. Defaults to "diagnostic_report.txt".
-    """
+    """Write the report string to disk."""
     with open(path, "w") as f:
         f.write(content)
