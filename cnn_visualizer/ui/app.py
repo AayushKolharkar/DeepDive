@@ -928,7 +928,8 @@ class CNNVisualizerApp(ctk.CTk):
             loading.destroy()
             layer_name = self.sidebar.config.get("layer", "")
             self.grid_view.update(images, title, force_rebuild=True,
-                                  health_metrics=health_metrics, layer_name=layer_name)
+                                  health_metrics=health_metrics, layer_name=layer_name,
+                                  cell_size=self.sidebar.config.get("cell_size", 140))
             self._update_telemetry(layer_name, None, input_stats, health_metrics)
             if flow_data:     self._last_flow_data = flow_data
             if sim_matrix is not None:
@@ -989,7 +990,8 @@ class CNNVisualizerApp(ctk.CTk):
             )
             layer_name = self.sidebar.config.get("layer", "")
             self.grid_view.update(images, title, force_rebuild=False,
-                                  health_metrics=health_metrics, layer_name=layer_name)
+                                  health_metrics=health_metrics, layer_name=layer_name,
+                                  cell_size=self.sidebar.config.get("cell_size", 140))
 
             # PERF FIX #7: telemetry updated here on main thread, not in pipeline
             self._update_telemetry(layer_name, None, input_stats, health_metrics)
