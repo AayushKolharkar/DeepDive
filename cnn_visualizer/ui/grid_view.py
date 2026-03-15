@@ -85,12 +85,15 @@ class GridView(ctk.CTkFrame):
         self._canvas: tk.Canvas | None = None
         self._wire_hscroll()
 
-        # Bind Shift+Wheel for horizontal scrolling
+        # Bind Shift+Wheel for horizontal scrolling.
+        # _scroll_frame is CTkScrollableFrame so its bind() works fine.
         self._scroll_frame.bind("<Shift-MouseWheel>",  self._on_hscroll_wheel)
         self._scroll_frame.bind("<Shift-Button-4>",    self._on_hscroll_wheel)
         self._scroll_frame.bind("<Shift-Button-5>",    self._on_hscroll_wheel)
-        # Also bind on the outer frame so it's always captured
-        self.bind("<Shift-MouseWheel>", self._on_hscroll_wheel)
+        # For the outer CTkFrame we must bypass CTkFrame.bind() which routes
+        # through self._canvas (None during __init__). Use tk.Widget.bind directly.
+        import tkinter as _tk
+        _tk.Widget.bind(self, "<Shift-MouseWheel>", self._on_hscroll_wheel)
 
         # ── Title label (row 0 inside scroll frame) ───────────────────────
         self._title_label = ctk.CTkLabel(
