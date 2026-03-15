@@ -105,6 +105,37 @@ def _vignette_overlay(width: int, height: int, strength: float = 0.6) -> Image.I
     return Image.fromarray(arr, mode="RGBA")
 
 
+def parse_channel_filter(raw: str) -> set[int] | None:
+    """
+    Parse a channel filter string into a set of channel indices.
+    Supports comma-separated values and ranges:
+        "0-5, 10, 15-20"  →  {0,1,2,3,4,5,10,15,16,17,18,19,20}
+        ""  or  "all"      →  None  (show everything)
+    Invalid tokens are silently ignored.
+    """
+    raw = raw.strip()
+    if not raw or raw.lower() == "all":
+        return None
+    result: set[int] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            parts = token.split("-", 1)
+            try:
+                lo, hi = int(parts[0].strip()), int(parts[1].strip())
+                result.update(range(lo, hi + 1))
+            except ValueError:
+                pass
+        else:
+            try:
+                result.add(int(token))
+            except ValueError:
+                pass
+    return result if result else None
+
+
 # ── Main application ──────────────────────────────────────────────────────────
 
 class CNNVisualizerApp(ctk.CTk):
@@ -927,9 +958,12 @@ class CNNVisualizerApp(ctk.CTk):
             )
             loading.destroy()
             layer_name = self.sidebar.config.get("layer", "")
+            ch_filter = parse_channel_filter(
+                self.sidebar.config.get("channel_filter_raw", ""))
             self.grid_view.update(images, title, force_rebuild=True,
                                   health_metrics=health_metrics, layer_name=layer_name,
-                                  cell_size=self.sidebar.config.get("cell_size", 140))
+                                  cell_size=self.sidebar.config.get("cell_size", 140),
+                                  channel_filter=ch_filter)
             self._update_telemetry(layer_name, None, input_stats, health_metrics)
             if flow_data:     self._last_flow_data = flow_data
             if sim_matrix is not None:
@@ -989,9 +1023,12 @@ class CNNVisualizerApp(ctk.CTk):
                 self._result_queue.get_nowait()
             )
             layer_name = self.sidebar.config.get("layer", "")
+            ch_filter = parse_channel_filter(
+                self.sidebar.config.get("channel_filter_raw", ""))
             self.grid_view.update(images, title, force_rebuild=False,
                                   health_metrics=health_metrics, layer_name=layer_name,
-                                  cell_size=self.sidebar.config.get("cell_size", 140))
+                                  cell_size=self.sidebar.config.get("cell_size", 140),
+                                  channel_filter=ch_filter)
 
             # PERF FIX #7: telemetry updated here on main thread, not in pipeline
             self._update_telemetry(layer_name, None, input_stats, health_metrics)

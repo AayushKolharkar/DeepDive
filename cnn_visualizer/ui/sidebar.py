@@ -260,6 +260,40 @@ class Sidebar(ctk.CTkScrollableFrame):
         self.cell_size_slider.set(self._current_cell_size)
         self.cell_size_slider.pack(fill="x", padx=12, pady=(0, 12))
 
+        # ── Channel filter ────────────────────────────────────────────────
+        # Placed in Display section. User types channel indices or ranges.
+        ctk.CTkLabel(
+            sec_disp,
+            text="Channel Filter (e.g. 0-5, 10, 15-20):",
+            font=ctk.CTkFont(size=10),
+            text_color=C_TEXT_SEC,
+        ).pack(anchor="w", padx=12, pady=(0, 2))
+
+        filter_row = ctk.CTkFrame(sec_disp, fg_color="transparent")
+        filter_row.pack(fill="x", padx=12, pady=(0, 4))
+        filter_row.grid_columnconfigure(0, weight=1)
+        filter_row.grid_columnconfigure(1, weight=0)
+
+        self.channel_filter_entry = ctk.CTkEntry(
+            filter_row,
+            placeholder_text="All channels",
+            fg_color=C_BG_BASE,
+            border_color=C_BORDER_SUB,
+            text_color=C_TEXT_PRI,
+        )
+        self.channel_filter_entry.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+
+        self.channel_filter_clear_btn = ctk.CTkButton(
+            filter_row,
+            text="✕",
+            width=28,
+            fg_color=C_BG_FLOAT,
+            hover_color=C_CRITICAL,
+            text_color=C_TEXT_PRI,
+            command=self._clear_channel_filter,
+        )
+        self.channel_filter_clear_btn.grid(row=0, column=1)
+
         # ── Section 7: Diagnostics ────────────────────────────────────────
         sec_diag = self._sidebar_section(self, "Diagnostics")
         sec_diag.pack(fill="x", padx=10, pady=6)
@@ -305,6 +339,10 @@ class Sidebar(ctk.CTkScrollableFrame):
             self.channel_label.pack(anchor="w", padx=12)
             self.channel_entry.pack(fill="x", padx=12, pady=(0, 10))
 
+    def _clear_channel_filter(self):
+        """Clear the channel filter entry."""
+        self.channel_filter_entry.delete(0, "end")
+
     def _on_speed_slider(self, value: float):
         self._current_speed = int(value)
         self.speed_display_label.configure(text=f"Interval: {self._current_speed}ms")
@@ -333,6 +371,7 @@ class Sidebar(ctk.CTkScrollableFrame):
             "speed":           self._current_speed,
             "dead_threshold":  self.health_slider.get(),
             "cell_size":       self._current_cell_size,
+            "channel_filter_raw": self.channel_filter_entry.get().strip(),
             "flow_chart":      True,
             "corr_matrix":     True,
         }
